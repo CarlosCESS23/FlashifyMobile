@@ -570,7 +570,7 @@ private const val BASE_URL = "http://192.168.0.10:8000/"
 Desenvolvido por:
 
 - **Gabriel Fernandes** - *Full Stack Developer* - [GitHub](https://github.com/g-f307) | [LinkedIn](https://www.linkedin.com/in/gabriel-fernandes-7684b4220/)
-- **Carlos Eduardo Souza** - *Front-end Developer*
+- **Carlos Eduardo Souza** - *Front-end Developer* -[GitHub](https://github.com/CarlosCESS23) | [LinkedIn](https://www.linkedin.com/in/carlos-souza-5843b11bb/)
 - **Rebecca Souza Xavier** - *UX/UI Designer*
 - **Yasmim Pessoa da Frota** - *UX/UI Designer*
 
