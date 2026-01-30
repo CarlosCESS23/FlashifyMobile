@@ -1,4 +1,3 @@
-# back/app/routers/auth.py
 import httpx
 import os
 from typing import Annotated
@@ -6,14 +5,18 @@ from ..models import AuthProvider
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import Session, SQLModel
+from datetime import datetime, timezone
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 from .. import crud, models, schemas, security
 from ..database import get_session
+from ..email_service import email_service  # 🆕 IMPORTAR
 
 router = APIRouter(tags=["Authentication"])
 
 @router.post("/users", response_model=schemas.UserRead, status_code=status.HTTP_201_CREATED)
-def create_new_user(user: schemas.UserCreate, session: Session = Depends(get_session)):
+async def create_new_user(user: schemas.UserCreate, session: Session = Depends(get_session)):
     db_user_email = crud.get_user_by_email(session=session, email=user.email)
     if db_user_email:
         raise HTTPException(
@@ -28,7 +31,19 @@ def create_new_user(user: schemas.UserCreate, session: Session = Depends(get_ses
             detail="Nome de usuário já registrado."
         )
     
-    return crud.create_user(session=session, user_create=user)
+    created_user = crud.create_user(session=session, user_create=user)
+    
+    # 🆕 ENVIAR E-MAIL DE BOAS-VINDAS (assíncrono, não bloqueia)
+    try:
+        await email_service.send_welcome_email(
+            email=created_user.email,
+            username=created_user.username
+        )
+    except Exception as e:
+        # Log do erro, mas não falha o registro
+        print(f"⚠️ Falha ao enviar e-mail de boas-vindas: {e}")
+    
+    return created_user
 
 @router.post("/token", response_model=schemas.Token)
 def login_for_access_token(
@@ -43,11 +58,18 @@ def login_for_access_token(
             detail="Nome de usuário/email ou senha incorretos",
             headers={"WWW-Authenticate": "Bearer"},
         )
-        
+    
+    # 🆕 ATUALIZAR ÚLTIMO LOGIN E RESETAR FLAG DE INATIVIDADE
+    user.last_login_at = datetime.now(timezone.utc)
+    user.inactivity_email_sent = False
+    session.add(user)
+    session.commit()
+    
     access_token = security.create_access_token(subject=user.email)
     
     return {"access_token": access_token, "token_type": "bearer"}
 
+# 🆕 ATUALIZAR TAMBÉM O LOGIN DO GOOGLE
 class GoogleAuthCode(SQLModel):
     code: str
 
@@ -92,11 +114,7 @@ async def auth_google(
 
     user_info = user_info_response.json()
     email = user_info.get("email")
-
-    # 🔽 CORREÇÃO APLICADA AQUI 🔽
-    # Usamos a variável 'email' que foi definida acima.
     username = user_info.get("name", email.split('@')[0] if email else "user")
-    
     profile_picture_url = user_info.get("picture")
 
     if not email:
@@ -109,8 +127,115 @@ async def auth_google(
         profile_picture_url=profile_picture_url
     )
     
+    # 🆕 ATUALIZAR ÚLTIMO LOGIN
+    db_user.last_login_at = datetime.now(timezone.utc)
+    db_user.inactivity_email_sent = False
+    session.add(db_user)
+    session.commit()
+    
+    # 🆕 SE FOR NOVO USUÁRIO (acabou de ser criado), ENVIAR E-MAIL DE BOAS-VINDAS
+    if not db_user.last_login_at or (datetime.now(timezone.utc) - db_user.created_at).seconds < 60:
+        try:
+            await email_service.send_welcome_email(
+                email=db_user.email,
+                username=db_user.username
+            )
+        except Exception as e:
+            print(f"⚠️ Falha ao enviar e-mail de boas-vindas: {e}")
+    
     jwt_token = security.create_access_token(subject=db_user.email)
     return {"access_token": jwt_token, "token_type": "bearer"}
+
+class GoogleIdTokenRequest(SQLModel):
+    """Requisição para login via ID Token (mobile)"""
+    id_token: str
+
+@router.post("/google/mobile", response_model=schemas.Token)
+async def auth_google_mobile(
+    token_request: GoogleIdTokenRequest,
+    session: Session = Depends(get_session)
+):
+    """
+    Endpoint para autenticação Google via ID Token (app mobile).
+    O app Android envia o ID Token diretamente, validado pelo SHA-1.
+    Não requer Client Secret porque a segurança vem do certificado SHA-1.
+    """
+    try:
+        # 1. Obter Client ID das variáveis de ambiente
+        google_client_id = os.getenv("GOOGLE_CLIENT_ID")
+        if not google_client_id:
+            raise HTTPException(
+                status_code=500, 
+                detail="GOOGLE_CLIENT_ID não configurado no servidor"
+            )
+        
+        print(f"🔐 Validando ID Token com Client ID: {google_client_id[:20]}...")
+        
+        # 2. Validar o ID Token com o Google
+        # A biblioteca google-auth valida automaticamente:
+        # - Assinatura do token
+        # - Expiração
+        # - Emissor (Google)
+        # - Audience (seu Client ID)
+        idinfo = id_token.verify_oauth2_token(
+            token_request.id_token,
+            google_requests.Request(),
+            google_client_id
+        )
+        
+        # 3. Verificar emissor do token (segurança extra)
+        if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+            print(f"❌ Emissor inválido: {idinfo['iss']}")
+            raise HTTPException(status_code=400, detail="Token de origem inválida")
+        
+        # 4. Extrair informações do usuário
+        email = idinfo.get('email')
+        name = idinfo.get('name')
+        picture = idinfo.get('picture')
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="Email não encontrado no token")
+        
+        # Se não tiver nome, usa a parte antes do @ do email
+        if not name:
+            name = email.split('@')[0]
+        
+        print(f"✅ Usuário autenticado: {email} (Nome: {name})")
+        
+        # 5. Criar ou atualizar usuário no banco
+        db_user = crud.get_or_create_google_user(
+            session=session,
+            email=email,
+            username=name,
+            profile_picture_url=picture
+        )
+        
+        # 6. Gerar JWT token da nossa aplicação
+        jwt_token = security.create_access_token(subject=db_user.email)
+        
+        print(f"🎫 Token JWT gerado para: {db_user.email}")
+        
+        return {"access_token": jwt_token, "token_type": "bearer"}
+        
+    except ValueError as e:
+        # Token inválido, expirado ou com audience incorreta
+        print(f"❌ Erro de validação: {str(e)}")
+        raise HTTPException(
+            status_code=401,
+            detail=f"Token inválido ou expirado: {str(e)}"
+        )
+    except HTTPException:
+        # Re-lançar HTTPExceptions que já criamos
+        raise
+    except Exception as e:
+        # Qualquer outro erro inesperado
+        print(f"❌ Erro inesperado na autenticação: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro interno ao processar autenticação"
+        )
 
 @router.post("/users/me/change-password", status_code=status.HTTP_204_NO_CONTENT)
 def change_current_user_password(
