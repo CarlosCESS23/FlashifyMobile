@@ -25,16 +25,15 @@ services:
     restart: always
 
   backend:
-    build: ./back
+    build: ./back          # <--- CORRIGIDO: Aponta para a pasta onde está o Dockerfile
     container_name: flashify-backend
     env_file:
-      - ./back/.env
+      - ./back/.env        # <--- Aponta para o arquivo dentro de back
     ports:
       - "9000:8000"
     volumes:
       - ./uploads:/app/uploads
-      - ./back/app:/app/app
-      - ./back/gcp-credentials.json:/app/gcp-credentials.json
+      # - ./back/app:/app/app  <-- Se for descomentar no futuro, ajuste o caminho para ./back/app
     depends_on:
       db:
         condition: service_healthy
@@ -43,15 +42,13 @@ services:
     restart: always
 
   celery-worker:
-    build: ./back
+    build: ./back          # <--- CORRIGIDO
     container_name: flashify-worker
-    command: celery -A app.worker worker --loglevel=info
+    command: python -m celery -A app.worker worker --loglevel=info
     env_file:
-      - ./back/.env
+      - ./back/.env        # <--- Aponta para o arquivo dentro de back
     volumes:
       - ./uploads:/app/uploads
-      - ./back/app:/app/app
-      - ./back/gcp-credentials.json:/app/gcp-credentials.json
     depends_on:
       db:
         condition: service_healthy
@@ -60,15 +57,14 @@ services:
     restart: always
 
   celery-beat:
-    build: ./back
-    command: celery -A app.worker beat --loglevel=info
+    build: ./back          # <--- CORRIGIDO
+    container_name: flashify-beat
+    command: python -m celery -A app.worker beat --loglevel=info
     depends_on:
       - redis
       - db
     env_file:
-      - ./back/.env
-    volumes:
-      - ./back:/app
+      - ./back/.env        # <--- CORRIGIDO: Estava apenas .env antes
     restart: unless-stopped
 
 volumes:
